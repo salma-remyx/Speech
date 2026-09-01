@@ -1,0 +1,17 @@
+schema_version: 1
+fork: salma-remyx/Speech
+observed_landing_zones:
+- path: nemo/collections/tts/modules/magpietts_inference/
+  shape_tags:
+  - library-shape-public-api
+  confirmed_by:
+  - arxiv: 2608.18661v1
+    mode: Mode 2 (adapted port)
+    call_site_specifics: MagpieInferenceRunner._run_unified_inference (nemo/collections/tts/modules/magpietts_inference/inference.py:559),
+      reached from the pre-existing run_inference_on_dataset path and the examples/tts/magpi
+    branch: x2streaming-tts-causal-token-level-text-to-speech-from-strea
+    timestamp: '2026-09-01T02:32:41Z'
+  last_observed: '2026-09-01T02:32:41Z'
+rejected_shapes: []
+coordination_signals: []
+last_updated: '2026-09-01T02:32:41Z'
