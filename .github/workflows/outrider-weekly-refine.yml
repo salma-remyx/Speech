@@ -11,14 +11,12 @@ name: Outrider weekly refine
 # selection + spec authorship + dispatch; the refinement itself runs via
 # outrider.yml (mode=recommend + pin-arxiv + start-from-ref + lead-content).
 #
-# Requires ANTHROPIC_API_KEY for the gap-analysis LLM call and the
+# Requires MOONSHOT_API_KEY for the gap-analysis LLM call and the
 # downstream refinement dispatch. Linear connector is optional — this
 # workflow passes the gap analysis inline as raw markdown, no Linear
 # write side needed.
 
 on:
-  schedule:
-    - cron: '0 12 * * 1'   # Mondays 12:00 UTC — after weekend accumulates
   workflow_dispatch:
     inputs:
       lookback-days:
@@ -47,7 +45,7 @@ jobs:
       pull-requests: read   # to check whether candidates are already promoted
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
     steps:
       - name: Pick candidate from past week's drafter output
         id: pick
@@ -192,22 +190,24 @@ jobs:
               """).strip()
 
           req = urllib.request.Request(
-              "https://api.anthropic.com/v1/messages",
+              "https://api.moonshot.ai/anthropic/v1/messages",
               data=json.dumps({
-                  "model": "claude-sonnet-4-6",
+                  "model": "kimi-k3",
                   "max_tokens": 4096,
                   "messages": [{"role": "user", "content": prompt_body}],
               }).encode(),
               headers={
                   "Content-Type": "application/json",
-                  "x-api-key": os.environ["ANTHROPIC_API_KEY"],
+                  "x-api-key": os.environ["MOONSHOT_API_KEY"],
                   "anthropic-version": "2023-06-01",
               },
               method="POST",
           )
           resp = urllib.request.urlopen(req, timeout=120).read()
           data = json.loads(resp)
-          print(data["content"][0]["text"])
+          text = next((b["text"] for b in data["content"]
+                       if b.get("type") == "text"), "")
+          print(text)
           PYEOF
 
           echo "→ gap analysis (first 400 chars):"
