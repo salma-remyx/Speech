@@ -207,6 +207,31 @@ For batch inference from manifests:
      - ``auto``: detect from text, ``always``: force longform, ``never``: disable
 
 
+Streaming text commitment (causal segmentation)
+-----------------------------------------------
+
+By default the CLI splits long texts into chunks offline, after the full
+utterance is known, which is only pseudo-streaming. Pass ``--streaming_commit``
+to segment instead with a causal commitment policy that decides, from the text
+that has already arrived alone, when a chunk is ready for synthesis: a segment
+is committed at sentence-ending punctuation as soon as it arrives, ambiguous
+tails are kept provisional (abbreviations such as ``Dr.``, numbers still
+forming such as ``3.``, unclosed brackets), and buffering is bounded by
+``--streaming_commit_capacity`` (in words, or characters for zh/ja). Chunk
+boundaries still inherit acoustic history through the model's ``ChunkState``,
+and commit statistics (including a text-level time-to-first-audio proxy,
+``stream_commit_units_before_first_commit``) are written to the RTF metrics.
+
+.. code-block:: bash
+
+    python examples/tts/magpietts_inference.py \
+        --nemo_files /path/to/magpietts.nemo \
+        --datasets_json_path /path/to/evalset_config.json \
+        --out_dir /path/to/output \
+        --codecmodel_path /path/to/codec.nemo \
+        --streaming_commit --streaming_commit_capacity 20
+
+
 Configuration Dataclasses
 #########################
 

@@ -44,6 +44,10 @@ from nemo.collections.common.tokenizers.text_to_speech.tts_tokenizers import Agg
 from nemo.collections.tts.data.text_to_speech_dataset import ChunkedTTSInferenceDataset, MagpieTTSDataset
 from nemo.collections.tts.models.easy_magpietts_inference import EasyModelInferenceParameters
 from nemo.collections.tts.models.magpietts import ModelInferenceParameters
+from nemo.collections.tts.parts.utils.streaming_text_commit import (
+    StreamingCommitConfig,
+    apply_streaming_commitment_to_batch,
+)
 from nemo.collections.tts.parts.utils.tts_dataset_utils import normalize_volume, stack_tensors
 from nemo.utils import logging
 
@@ -93,10 +97,15 @@ class MagpieInferenceConfig(BaseInferenceConfig):
         maskgit_noise_scale: Noise scale for MaskGit sampling.
         maskgit_fixed_schedule: Fixed schedule for MaskGit (optional).
         maskgit_sampling_type: Type of MaskGit sampling.
+        streaming_commit_config: Causal text commitment policy for streaming text.
+            When set, the runner segments each sample's raw text with a prefix-only
+            policy (see ``streaming_text_commit``) instead of using the dataset's
+            offline sentence chunks. None keeps the offline chunks.
     """
 
     model_inference_parameters: ModelInferenceParameters = field(default_factory=ModelInferenceParameters)
     apply_attention_prior: bool = False
+    streaming_commit_config: Optional[StreamingCommitConfig] = None
 
     # MaskGit parameters
     maskgit_n_steps: int = 3
@@ -138,6 +147,9 @@ class MagpieInferenceConfig(BaseInferenceConfig):
                 f"IgnoreFST_{self.model_inference_parameters.ignore_finished_sentence_tracking}",
             ]
         )
+
+        if self.streaming_commit_config is not None:
+            parts.append(f"StreamCommit{self.streaming_commit_config.max_segment_units}")
 
         return "_".join(parts)
 
@@ -458,6 +470,37 @@ class MagpieInferenceRunner(BaseInferenceRunner):
         dataset.text_tokenizer = self.model.tokenizer
         return dataset
 
+    def apply_streaming_commitment(self, batch: Dict[str, Any], dataset: Any = None) -> Dict[str, float]:
+        """Re-derive the batch's text chunks by causal text commitment.
+
+        Segments each sample's raw text as if it arrived unit by unit (see
+        ``streaming_text_commit``) and rewrites ``chunked_tokens`` in place, so
+        the chunk loop synthesizes causally committed segments instead of the
+        dataset's offline sentence chunks. Acoustic history still crosses
+        segment boundaries through ``ChunkState``.
+
+        Args:
+            batch: Inference batch dictionary containing ``raw_texts``.
+            dataset: Dataset that produced the batch; used only to match its
+                phoneme-span tokenization settings.
+
+        Returns:
+            Commit statistics averaged over the batch (empty when disabled).
+        """
+        if self.config.streaming_commit_config is None:
+            return {}
+        return apply_streaming_commitment_to_batch(
+            batch,
+            text_tokenizer=self.model.tokenizer,
+            eos_token_id=self.model.eos_id,
+            config=self.config.streaming_commit_config,
+            enable_phoneme_text_input=getattr(dataset, "enable_phoneme_text_input", False),
+            phoneme_tokenizer=getattr(dataset, "phoneme_tokenizer", None),
+            text_phoneme_token_offset=getattr(dataset, "text_phoneme_token_offset", None),
+            bop_marker=getattr(dataset, "phoneme_text_bop_marker", "<bop>"),
+            eop_marker=getattr(dataset, "phoneme_text_eop_marker", "<eop>"),
+        )
+
     def _run_unified_inference(
         self,
         dataset: ChunkedTTSInferenceDataset,
@@ -510,6 +553,10 @@ class MagpieInferenceRunner(BaseInferenceRunner):
             batch = self._batch_to_cuda(batch)
             batch['sample_rate'] = self.model.output_sample_rate
             batch['context_sample_rate'] = self.model.output_sample_rate
+
+            # Causally commit streaming text into synthesis chunks (no-op
+            # unless streaming_commit_config is set on the config).
+            commit_stats = self.apply_streaming_commitment(batch, dataset=dataset)
 
             batch_size = len(batch['chunked_tokens'])
             max_num_chunks = max(len(tokens) for tokens in batch['chunked_tokens'])
@@ -613,6 +660,7 @@ class MagpieInferenceRunner(BaseInferenceRunner):
                 'audio_seconds': total_audio_seconds,
                 'rtf': rtf,
             }
+            rtf_metrics.update({f'stream_commit_{key}': value for key, value in commit_stats.items()})
             all_rtf_metrics.append(rtf_metrics)
 
             # Save outputs

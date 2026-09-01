@@ -51,6 +51,16 @@ Example usage:
         --codecmodel_path /path/to/codec.nemo \\
         --run_evaluation \\
         --num_repeats 3
+
+    # Streaming text: commit synthesis chunks causally as text arrives instead
+    # of waiting for the full sentence chunks produced offline by the dataset
+    python examples/tts/magpietts_inference.py \\
+        --model_type magpie \\
+        --nemo_files /path/to/model.nemo \\
+        --datasets_json_path /path/to/evalset_config.json \\
+        --out_dir /path/to/output \\
+        --codecmodel_path /path/to/codec.nemo \\
+        --streaming_commit
 """
 from __future__ import annotations
 

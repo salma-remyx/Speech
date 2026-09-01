@@ -49,6 +49,7 @@ from nemo.collections.tts.modules.magpietts_inference.inference import (
     MagpieInferenceRunner,
 )
 from nemo.collections.tts.modules.magpietts_modules import EOSDetectionMethod
+from nemo.collections.tts.parts.utils.streaming_text_commit import StreamingCommitConfig
 from nemo.utils import logging
 
 
@@ -1321,6 +1322,18 @@ def _add_magpie_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         choices=["default", "causal", "purity_causal", "purity_default"],
     )
+    group.add_argument(
+        '--streaming_commit',
+        action='store_true',
+        help='Commit text into synthesis chunks causally as it arrives (streaming) '
+        'instead of using the offline sentence chunking of the dataset',
+    )
+    group.add_argument(
+        '--streaming_commit_capacity',
+        type=int,
+        default=25,
+        help='Maximum buffered text units (words, or characters for zh/ja) per committed segment',
+    )
 
 
 def _add_easy_magpie_args(parser: argparse.ArgumentParser) -> None:
@@ -1386,6 +1399,11 @@ def _build_magpie_config(args) -> MagpieInferenceConfig:
         maskgit_noise_scale=args.maskgit_noise_scale,
         maskgit_fixed_schedule=args.maskgit_fixed_schedule,
         maskgit_sampling_type=args.maskgit_sampling_type,
+        streaming_commit_config=(
+            StreamingCommitConfig(max_segment_units=args.streaming_commit_capacity)
+            if args.streaming_commit
+            else None
+        ),
         default_tokenizer_name=args.tokenizer_name,
     )
 
