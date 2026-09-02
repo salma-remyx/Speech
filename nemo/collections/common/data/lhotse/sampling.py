@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import Any, Sequence
 
 import numpy as np
-from lhotse.cut import Cut
+from lhotse.cut import Cut, MonoCut
 from lhotse.dataset import SamplingConstraint, TokenConstraint
 from lhotse.dataset.sampling.dynamic_bucketing import FixedBucketBatchSizeConstraint
 from lhotse.utils import ifnone
@@ -266,6 +266,110 @@ class DurationFilter:
             return self.d_min <= tot_dur <= self.d_max
         else:
             return True  # does not apply to text etc.
+
+
+class ValidationStatusFilter:
+    """
+    Callable, returns ``True`` if a cut's validation status is equal to keep and ``False`` otherwise.
+    Acts as a pass-through for objects of other type than Cut.
+    """
+
+    def __init__(self, keep: str = "pass") -> None:
+        self.keep = keep
+
+    def __call__(self, example) -> bool:
+        if (
+            isinstance(example, MonoCut)
+            and example.has_custom("validation_status")
+            and example.validation_status != self.keep
+        ):
+            return False
+        else:
+            return True
+
+
+class CERFilter:
+    """
+    Callable, returns ``True`` if a cut's CER is less than max_cer and ``False`` otherwise.
+    Acts as a pass-through for objects of other type than Cut.
+    """
+
+    def __init__(self, max_cer: float | None) -> None:
+        self.max_cer = ifnone(max_cer, float("inf"))
+
+    def __call__(self, example) -> bool:
+        if (
+            isinstance(example, MonoCut)
+            and len(example.supervisions) > 0
+            and example.supervisions[0].has_custom("cer")
+        ):
+            return example.supervisions[0].cer <= self.max_cer
+        else:
+            return True
+
+
+class SpeakerFilter:
+    """
+    Callable, returns ``False`` if any supervision in a cut belongs to an excluded speaker.
+    Checks configured supervision attributes/custom fields.
+    Acts as a pass-through for objects of other type than Cut.
+    """
+
+    def __init__(
+        self,
+        excluded_speaker_ids: Sequence[str] | None = None,
+        speaker_fields: Sequence[str] = None,
+    ) -> None:
+        self.excluded_speaker_ids = set(ifnone(excluded_speaker_ids, ()))
+        self.enabled = len(self.excluded_speaker_ids) > 0
+        if self.enabled and speaker_fields is None:
+            raise ValueError(
+                "SpeakerFilter requires speaker_fields when excluded_speaker_ids is set. "
+                "Example: speaker_filter_fields=[speaker_id]"
+            )
+        self.speaker_fields = tuple(ifnone(speaker_fields, ()))
+
+    def __call__(self, example) -> bool:
+        if not self.enabled or not isinstance(example, Cut):
+            return True
+
+        excluded_speaker_ids = self.excluded_speaker_ids
+
+        for supervision in example.supervisions:
+            for field in self.speaker_fields:
+                if supervision.has_custom(field):
+                    speaker_id = getattr(supervision, field)
+                else:
+                    speaker_id = getattr(supervision, field, None)
+
+                # Support the TTS speaker ID format:
+                # | Language:en Dataset:<dataset_name> Speaker:<speaker_id> |
+                if isinstance(speaker_id, str) and "Speaker:" in speaker_id:
+                    speaker_id = speaker_id.rsplit("Speaker:", maxsplit=1)[-1].split("|", maxsplit=1)[0].strip()
+
+                if speaker_id in excluded_speaker_ids:
+                    return False
+        return True
+
+
+class ContextSpeakerSimilarityFilter:
+    """
+    Callable, returns ``True`` if a cut's context speaker similarity is greater than min_context_speaker_similarity and ``False`` otherwise.
+    Acts as a pass-through for objects of other type than Cut.
+    """
+
+    def __init__(self, min_context_speaker_similarity: float | None) -> None:
+        self.min_context_speaker_similarity = ifnone(min_context_speaker_similarity, -1)
+
+    def __call__(self, example) -> bool:
+        if (
+            isinstance(example, MonoCut)
+            and len(example.supervisions) > 0
+            and example.supervisions[0].has_custom("context_speaker_similarity")
+        ):
+            return example.supervisions[0].context_speaker_similarity >= self.min_context_speaker_similarity
+        else:
+            return True
 
 
 class TokenCountFilter:

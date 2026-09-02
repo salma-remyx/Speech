@@ -21,10 +21,9 @@ from tempfile import NamedTemporaryFile
 from typing import List, Optional, Tuple, Union
 
 import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, open_dict
 from tqdm.auto import tqdm
 
-import nemo.collections.asr as nemo_asr
 from nemo.collections.asr.metrics.wer import word_error_rate
 from nemo.collections.asr.models import ASRModel, EncDecMultiTaskModel
 from nemo.collections.asr.parts.utils import manifest_utils, rnnt_utils
@@ -37,6 +36,24 @@ _MPS_WARNING_TEXT = (
     "MPS device (Apple Silicon M-series GPU) support is experimental."
     " Env variable `PYTORCH_ENABLE_MPS_FALLBACK=1` should be set in most cases to avoid failures."
 )
+
+
+def wire_confidence_cfg(decoding_cfg: DictConfig, enabled: bool = True) -> None:
+    """Enable confidence estimation on a CTC or RNNT decoding config.
+
+    Mirrors the greedy/beam strategy override pattern used by ``ConfidenceMixin._init_confidence``.
+    """
+    if not enabled:
+        return
+    with open_dict(decoding_cfg):
+        decoding_cfg.confidence_cfg.preserve_frame_confidence = True
+        decoding_cfg.confidence_cfg.preserve_token_confidence = True
+        decoding_cfg.confidence_cfg.preserve_word_confidence = True
+        strategy = decoding_cfg.get("strategy", "greedy")
+        if strategy in ("greedy", "greedy_batch"):
+            decoding_cfg.greedy.preserve_frame_confidence = True
+        elif strategy in ("malsd_batch", "maes_batch"):
+            decoding_cfg.beam.preserve_frame_confidence = True
 
 
 def get_auto_inference_device(allow_mps: bool = True) -> torch.device:
@@ -109,6 +126,7 @@ def get_buffered_pred_feat_rnnt(
     batch_size: int,
     manifest: str = None,
     filepaths: List[list] = None,
+    target_lang_id: str = None,
     accelerator: Optional[str] = 'cpu',
 ) -> List[rnnt_utils.Hypothesis]:
     """
@@ -117,6 +135,7 @@ def get_buffered_pred_feat_rnnt(
     """
     hyps = []
     refs = []
+    lang_ids = []
 
     if filepaths and manifest:
         raise ValueError("Please select either filepaths or manifest")
@@ -137,22 +156,46 @@ def get_buffered_pred_feat_rnnt(
                 if 'text' in row:
                     refs.append(row['text'])
 
+                # Extract language from manifest
+                if 'target_lang' in row:
+                    lang_ids.append(row['target_lang'])
+                elif 'lang' in row:
+                    lang_ids.append(row['lang'])
+                else:
+                    # Use target_lang_id as fallback
+                    lang_ids.append(target_lang_id)
+    else:
+        # If filepaths are provided directly, use lang_id from config for all
+        lang_ids = [target_lang_id] * len(filepaths)
+        logging.info(f"filepaths are provided directly and target_lang_id: {target_lang_id}")
     with torch.inference_mode():
         with torch.amp.autocast('cpu' if accelerator == 'cpu' else 'cuda'):
             batch = []
+            batch_lang_ids = []
             asr.sample_offset = 0
             for idx in tqdm(range(len(filepaths)), desc='Sample:', total=len(filepaths)):
-                batch.append((filepaths[idx]))
+                batch.append(filepaths[idx])
+                batch_lang_ids.append(lang_ids[idx])
 
                 if len(batch) == batch_size:
                     audio_files = [sample for sample in batch]
 
+                    # Reset ASR for new batch
                     asr.reset()
+
+                    # Set the language ID if any valid language ID exists
+                    if any(lid is not None for lid in batch_lang_ids):
+                        # Find the first non-None language ID to use
+                        lang_id = next((lid for lid in batch_lang_ids if lid is not None), None)
+                        if lang_id is not None:
+                            asr.set_target_lang_id(lang_id)
+
                     asr.read_audio_file(audio_files, delay, model_stride_in_secs)
                     hyp_list = asr.transcribe(tokens_per_chunk, delay)
                     hyps.extend(hyp_list)
 
                     batch.clear()
+                    batch_lang_ids.clear()
                     asr.sample_offset += batch_size
 
             if len(batch) > 0:
@@ -160,78 +203,20 @@ def get_buffered_pred_feat_rnnt(
                 asr.frame_bufferer.batch_size = len(batch)
                 asr.reset()
 
+                # Set the language ID for the remaining batch
+                if any(lid is not None for lid in batch_lang_ids):
+                    lang_id = next((lid for lid in batch_lang_ids if lid is not None), None)
+                    if lang_id is not None:
+                        asr.set_target_lang_id(lang_id)
+
                 audio_files = [sample for sample in batch]
                 asr.read_audio_file(audio_files, delay, model_stride_in_secs)
                 hyp_list = asr.transcribe(tokens_per_chunk, delay)
                 hyps.extend(hyp_list)
 
                 batch.clear()
+                batch_lang_ids.clear()
                 asr.sample_offset += len(batch)
-
-    if os.environ.get('DEBUG', '0') in ('1', 'y', 't'):
-        if len(refs) == 0:
-            print("ground-truth text does not present!")
-            for hyp in hyps:
-                print("hyp:", hyp)
-        else:
-            for hyp, ref in zip(hyps, refs):
-                print("hyp:", hyp)
-                print("ref:", ref)
-
-    wrapped_hyps = wrap_transcription(hyps)
-    return wrapped_hyps
-
-
-def get_buffered_pred_feat(
-    asr: FrameBatchASR,
-    frame_len: float,
-    tokens_per_chunk: int,
-    delay: int,
-    preprocessor_cfg: DictConfig,
-    model_stride_in_secs: int,
-    device: Union[List[int], int],
-    manifest: str = None,
-    filepaths: List[list] = None,
-) -> List[rnnt_utils.Hypothesis]:
-    """
-    Moved from examples/asr/asr_chunked_inference/ctc/speech_to_text_buffered_infer_ctc.py
-    Write all information presented in input manifest to output manifest and removed WER calculation.
-    """
-    # Create a preprocessor to convert audio samples into raw features,
-    # Normalization will be done per buffer in frame_bufferer
-    # Do not normalize whatever the model's preprocessor setting is
-    preprocessor_cfg.normalize = "None"
-    preprocessor = nemo_asr.models.EncDecCTCModelBPE.from_config_dict(preprocessor_cfg)
-    preprocessor.to(device)
-    hyps = []
-    refs = []
-
-    if filepaths and manifest:
-        raise ValueError("Please select either filepaths or manifest")
-    if filepaths is None and manifest is None:
-        raise ValueError("Either filepaths or manifest shoud not be None")
-
-    if filepaths:
-        for L in tqdm(filepaths, desc="Sample:"):
-            asr.reset()
-            asr.read_audio_file(L, delay, model_stride_in_secs)
-            hyp = asr.transcribe(tokens_per_chunk, delay)
-            hyps.append(hyp)
-    else:
-        with open(manifest, "r", encoding='utf_8') as mfst_f:
-            for L in tqdm(mfst_f, desc="Sample:"):
-                asr.reset()
-                L = L.strip()
-                if not L:
-                    continue
-                row = json.loads(L)
-                if 'text' in row:
-                    refs.append(row['text'])
-                audio_file = get_full_path(audio_file=row['audio_filepath'], manifest_file=manifest)
-                # do not support partial audio
-                asr.read_audio_file(audio_file, delay, model_stride_in_secs)
-                hyp = asr.transcribe(tokens_per_chunk, delay)
-                hyps.append(hyp)
 
     if os.environ.get('DEBUG', '0') in ('1', 'y', 't'):
         if len(refs) == 0:
@@ -352,6 +337,8 @@ def setup_model(cfg: DictConfig, map_location: torch.device) -> Tuple[ASRModel, 
         asr_model.change_attention_model(
             self_attention_model=cfg.model_change.conformer.get("self_attention_model", None),
             att_context_size=cfg.model_change.conformer.get("att_context_size", None),
+            rope_base=cfg.model_change.conformer.get("rope_base", None),
+            rotary_fraction=cfg.model_change.conformer.get("rotary_fraction", None),
         )
 
     return asr_model, model_name
@@ -436,6 +423,7 @@ def restore_transcription_order(manifest_path: str, transcriptions: list) -> lis
     reordered = [None] * len(transcriptions)
     for new, old in enumerate(new2old):
         reordered[old] = transcriptions[new]
+
     if is_list:
         reordered = tuple(map(list, zip(*reordered)))
     return reordered
@@ -482,6 +470,7 @@ def write_transcription(
     filepaths: List[str] = None,
     compute_langs: bool = False,
     timestamps: bool = False,
+    confidence: bool = False,
 ) -> Tuple[str, str]:
     """Write generated transcription to output file."""
     if cfg.append_pred:
@@ -535,13 +524,19 @@ def write_transcription(
                             for key in timestamps.keys():
                                 values = normalize_timestamp_output(timestamps[key])
                                 item[f'{key}'] = values
+                    if confidence:
+                        if hasattr(transcription, "word_confidence"):
+                            item["word_confidence"] = transcription.word_confidence
+                            item["words"] = transcription.words
+                        if getattr(transcription, "token_confidence", None) is not None:
+                            item["token_confidence"] = transcription.token_confidence
 
                     if compute_langs:
                         item['pred_lang'] = transcription.langs
                         item['pred_lang_chars'] = transcription.langs_chars
                     if not cfg.decoding.beam.return_best_hypothesis:
                         item['beams'] = beams[idx]
-                f.write(json.dumps(item) + "\n")
+                f.write(json.dumps(item, ensure_ascii=False) + "\n")
         else:
             with open(cfg.dataset_manifest, 'r', encoding='utf-8') as fr:
                 for idx, line in enumerate(fr):
@@ -564,13 +559,21 @@ def write_transcription(
                                     values = normalize_timestamp_output(timestamps[key])
                                     item[f'{key}'] = values
 
+                        if confidence:
+                            hyp = best_hyps[idx]
+                            if hasattr(hyp, "word_confidence"):
+                                item["word_confidence"] = hyp.word_confidence
+                                item["words"] = hyp.words
+                            if getattr(hyp, "token_confidence", None) is not None:
+                                item["token_confidence"] = hyp.token_confidence
+
                         if compute_langs:
                             item['pred_lang'] = best_hyps[idx].langs
                             item['pred_lang_chars'] = best_hyps[idx].langs_chars
 
                         if not cfg.decoding.beam.return_best_hypothesis:
                             item['beams'] = beams[idx]
-                    f.write(json.dumps(item) + "\n")
+                    f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
     return cfg.output_filename, pred_text_attr_name
 

@@ -19,10 +19,26 @@ from nemo.collections.asr.parts.mixins.mixins import (
     ASRBPEMixin,
     ASRModuleMixin,
     DiarizationMixin,
+    PromptStreamingMixin,
 )
+from nemo.collections.asr.parts.mixins.multitalker_asr_mixins import SpeakerKernelMixin
 from nemo.collections.asr.parts.mixins.transcription import (
     ASRTranscriptionMixin,
     TranscribeConfig,
     TranscriptionMixin,
     TranscriptionReturnType,
 )
+
+__all__ = [
+    'ASRAdapterModelMixin',
+    'ASRBPEMixin',
+    'ASRModuleMixin',
+    'ASRTranscriptionMixin',
+    'DiarizationMixin',
+    'InterCTCMixin',
+    'PromptStreamingMixin',
+    'SpeakerKernelMixin',
+    'TranscribeConfig',
+    'TranscriptionMixin',
+    'TranscriptionReturnType',
+]
